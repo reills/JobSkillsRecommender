@@ -21,6 +21,86 @@ source("GlassDoorTableCleaner.R") #separated this process to another file to mak
 # Load the RPostgreSQL library
 library("RPostgres")
 
+
+
+#takes the db connection and current html page and saves it to the db
+saveDataToDB <- function(con, company_html, curr_companyname, curr_industry ) {
+  
+  #try getting a salary list page of a company 
+  parsedCompanyTable <- parseCompanySalaryPage(company_html)
+  
+  #add the company details to each row of the salary details
+  parsedCompanyTable <- parsedCompanyTable %>%
+    mutate(company_name = company_names[company_num],
+           company_industry = industry[company_num],
+           url = next_page_url
+    )   
+  
+  #print to see final data added to DB
+  print(parsedCompanyTable)
+  
+  # Write the dataframe to the PostgreSQL table
+  dbWriteTable(con, "glassdoorsalaries", parsedCompanyTable, append = TRUE, row.names = FALSE)
+}
+
+
+
+#need to wrap glassdoor calls with try catch since they keep failing from timeout 
+#http errors are caught and retried and make sure that the table result exists so not bad html page
+#THIS method will keep attempting to call url until max_attempts has been reached in case
+keepRetryingHtmlCaller <- function(url, max_attempts) {
+  success <- FALSE
+  DELAY_INCREMENT <- 8   #delay is how much to wait in seconds before making another request after getting blocked
+  attempts <- 0
+  
+  while (attempts < max_attempts && !success) {
+    tryCatch({
+      #get the html of the next page to scrape
+      company_html <- read_html(url )  
+      
+      # Try extracting tables from the webpage to make sure the company call worked
+      table_data <- html_table(company_html)
+      
+      #try extracting explorer id to make sure the companies call worked
+      element_exists <- !is.null(html_node(company_html, css = paste("#", "Explore", sep = "")))
+      
+      #make sure it's not empty
+      if( length(table_data) != 0 || element_exists) {
+        print("Tables successfully extracted.")
+        # If the read_html call is successful and we got the salary table, set success to TRUE
+        success <- TRUE
+      } else{
+        print("table is empty, need to retry")
+        attempts <<- attempts + 1
+        sleep_duration <- DELAY_INCREMENT * attempts
+        Sys.sleep(sleep_duration)
+      }
+      
+    }, error = function(e) {
+      # Print the error message
+      print(paste("Attempt", attempts, ": read html from glassdoor failed: ", e$message))
+      
+      # Increment the failed attempts count
+      attempts <<- attempts + 1
+      
+      # increase sleep duration each time
+      sleep_duration <- DELAY_INCREMENT * attempts
+      Sys.sleep(sleep_duration)
+    })
+  }
+  
+  #exit program if time out
+  if( success == FALSE || attempts == max_attempts ) { 
+    print("timed out after 10 retries") 
+    stop()
+  }
+  
+  #return the parsed out table
+  return(company_html)
+}
+
+
+
 # Set up the PostgreSQL connection
 con <- dbConnect(RPostgres::Postgres(), 
                  dbname = "dm",
@@ -36,25 +116,22 @@ GLASSDOOR_COMPANY_LIMIT <- 999
 GLASSDOOR_COMPANY_PER_PAGE <- 10
 
 #timeouts are caused by the http error 429 -- need to keep trying in these cases
-
-#delay is how much to wait in seconds before making another request after getting blocked
-DELAY_INCREMENT = 15
+MAX_ATTEMPTS <- 10
  
-
 #loop through all the companies on glassdoor... 
 for(i in 0:GLASSDOOR_COMPANY_LIMIT) { 
-#for(i in 1:GLASSDOOR_COMPANY_LIMIT){  
-  #companies_html  <- read_html("/Users/stephenreilly/Downloads/Browse Companies _ Glassdoor.html")
   
   #if we are at the first/last company on the page we need to get the next page of companies 
   if( i %% GLASSDOOR_COMPANY_PER_PAGE == 0 ) {
     #so page 1 is our first page, once we get to each next 10, the next page would be 2 or for 20 it would be 3
     next_page <- (i/GLASSDOOR_COMPANY_PER_PAGE)+1
     
-    print( paste0("https://www.glassdoor.com/Explore/browse-companies.htm?page=", next_page ))
+    #only 10 company pages are listed per page, so we need to go to the next one in the xplore list
+    next_company_url <- paste0("https://www.glassdoor.com/Explore/browse-companies.htm?page=", next_page )
+    print( next_company_url)
     
-    #company page to get different companies on glassdoor 
-    companies_html  <- read_html( paste0("https://www.glassdoor.com/Explore/browse-companies.htm?page=", next_page ))
+    #company page to get different companies on glassdoor, use special method that will keep trying if timeout happens
+    companies_html <- keepRetryingHtmlCaller(next_company_url, MAX_ATTEMPTS )
     
     #need to get the industry of each company
     company_names = companies_html %>% 
@@ -105,112 +182,41 @@ for(i in 0:GLASSDOOR_COMPANY_LIMIT) {
   print(glass_door_url)
   next_page_url <- glass_door_url
   
-  #sleep 5 seconds to avoid timeout requests
-  Sys.sleep(5)
-  
-  #parse the page of html where the 
-  company_html <- read_html(glass_door_url) 
+  #use special method to try to avoid timeout problems to get the html of the company
+  company_html <- keepRetryingHtmlCaller(glass_door_url, MAX_ATTEMPTS)
   
   #Get the number of page numbers for a company's salaries on Glassdoor to know how many tables to loop through 
   total_salary_tables <-  company_html %>%  html_nodes(".pagination_ListItem__CqGNZ:nth-last-child(2)  ") %>% html_text()
   
   #convert the page number from text to number 
   companysalary_pages <- as.numeric(total_salary_tables)-1
-  print(companysalary_pages)
-  #loop through each page fo a company for all the salaries that are associated with the company
-  for(j in 1:companysalary_pages){ 
-  #for(j in 1:companysalary_pages){ 
+  print(companysalary_pages) 
+  
+  #loop through each page of a company for all the salaries that are associated with the company
+  for(j in 1:companysalary_pages){  
     
-    #try getting a salary list page of a company 
-    parsedCompanyTable <- parseCompanySalaryPage(company_html)
+    #method parses the companies html into a good format and saves it to the postgress database
+    saveDataToDB(con, company_html, company_names[company_num],  industry[company_num])
     
-    #add the company details to each row of the salary details
-    parsedCompanyTable <- parsedCompanyTable %>%
-      mutate(company_name = company_names[company_num],
-             company_industry = industry[company_num],
-             url = next_page_url
-             
-      )    
-    print(parsedCompanyTable)
+    # Generate a random integer between 10 and 20 to sleep for that long and throw off glassdoor timeout 
+    random_integer <- sample(10:20, 1)
+    #sleep randomly between 10-20 seconds to avoid timeout requests
+    Sys.sleep(random_integer) 
     
-    # Generate a random integer between 10 and 30 to sleep for that long and throw off glassdoor timeout protection
-    random_integer <- sample(10:30, 1)
-    #sleep randomly between 30-60 seconds to avoid timeout requests
-    Sys.sleep(random_integer)
-      
-    # Write the dataframe to the PostgreSQL table
-    if( j != 0){
-      dbWriteTable(con, "glassdoorsalaries", parsedCompanyTable, append = TRUE, row.names = FALSE) 
-    }
-      
     #need to alter link so that the page number is incremented each time
     #url schema::   https://www.glassdoor.com/Salary/company-name-Salries-EID.htm
     next_page_url <- str_replace(glass_door_url, ".htm", paste0("_P", as.character(j+1), ".htm"))
     
     print(next_page_url)
-     
-    # Set maximum number of attempts
-    max_attempts <- 10
-    attempts <- 0
-    success <- FALSE
-    
+      
     #need to wrap this call in try catch since it keeps failing from timeout 
-    while (attempts < max_attempts && !success) {
-      tryCatch({
-        #get the html of the next page to scrape
-        company_html <- read_html(next_page_url)  
-        # Try extracting tables from the webpage to make sure the call worked
-        table_data <- html_table(company_html)
-        
-        #make sure it's not empty
-        if( length(table_data) != 0) {
-          print("Tables successfully extracted.")
-          # If the read_html call is successful and we got the salary table, set success to TRUE
-          success <- TRUE
-        } else{
-          print("table is empty, need to retry")
-          attempts <- attempts + 1
-          sleep_duration <- DELAY_INCREMENT * attempts
-          Sys.sleep(sleep_duration)
-        }
-        
-      }, error = function(e) {
-        # Print the error message
-        print(paste("Attempt", attempts, ": read html from glassdoor failed: ", e$message))
-        
-        # Increment the failed attempts count
-        attempts <- attempts + 1
-        
-        # increase sleep duration each time
-        sleep_duration <- DELAY_INCREMENT * attempts
-        Sys.sleep(sleep_duration)
-      })
-    }
-    #exit program if time out
-    if( success == FALSE || attempts == max_attempts ) { 
-      print("timed out after 10 retries") 
-      stop()
-    }
-    
+    campany_html <- keepRetryingHtmlCaller( next_page_url, MAX_ATTEMPTS )
   } 
-  
+   
   #last record needs to be parsed 
-  #try getting a salary list page of a company 
-  parsedCompanyTable <- parseCompanySalaryPage(company_html)
-  
-  #add the company details to each row of the salary details
-  parsedCompanyTable <- parsedCompanyTable %>%
-    mutate(company_name = company_names[company_num],
-           company_industry = industry[company_num],
-           url = next_page_url
-    )   
-  
-  # Write the dataframe to the PostgreSQL table
-  dbWriteTable(con, "glassdoorsalaries", parsedCompanyTable, append = TRUE, row.names = FALSE)
-  
-  #sleep 1 second to avoid timeout requests
-  Sys.sleep(10)  
+  saveDataToDB(con, company_html, company_names[company_num],  industry[company_num])
 }
 
  
+
  
